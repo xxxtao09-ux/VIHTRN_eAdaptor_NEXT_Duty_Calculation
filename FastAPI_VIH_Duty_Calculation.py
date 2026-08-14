@@ -146,6 +146,11 @@ def push_to_cargowise(update_xml: str) -> requests.Response:
     return resp
 
 
+@app.get("/")
+def health_check():
+    return {"status": "ok"}
+
+
 @app.post("/cw/duty_calculation")
 async def receive_xml(request: Request):
     body = await request.body()
