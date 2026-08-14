@@ -111,6 +111,7 @@ def calculate_total_duty(root: ET.Element) -> tuple[str, float]:
 
 def build_duty_update_xml(shipment_number: str, total_duty: float) -> str:
     return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
         f'<UniversalShipment xmlns="{CW_NAMESPACE}" version="1.0">'
         f"<Shipment>"
         f"<DataContext>"
@@ -155,6 +156,8 @@ def push_to_cargowise(update_xml: str) -> requests.Response:
         },
         timeout=60,
     )
+    if not resp.ok:
+        logger.error("CargoWise responded %s: %s", resp.status_code, resp.text)
     resp.raise_for_status()
     return resp
 
