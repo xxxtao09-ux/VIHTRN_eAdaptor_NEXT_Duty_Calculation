@@ -125,6 +125,7 @@ def build_duty_update_xml(shipment_number: str, total_duty: float) -> str:
         f"<SubShipment>"
         f"<CustomizedFieldCollection>"
         f"<CustomizedField>"
+        f"<DataType>String</DataType>"
         f"<Key>{DUTY_FIELD_KEY}</Key>"
         f"<Value>{total_duty:.2f}</Value>"
         f"</CustomizedField>"
