@@ -3,3 +3,4 @@ uvicorn[standard]
 requests
 cryptography
 PyJWT
+pymssql>=2.3.0
