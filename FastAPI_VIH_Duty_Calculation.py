@@ -1,10 +1,12 @@
 import base64
 import logging
 import os
+import secrets
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from contextlib import asynccontextmanager
+from decimal import Decimal, InvalidOperation
 
 import jwt
 import requests
@@ -12,12 +14,27 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import PlainTextResponse
+
+import db_logging
+from db_logging import LogEvent
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vih_duty_calculation")
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Starts the background Azure SQL writer thread. If the database is
+    # unreachable or misconfigured this logs and disables itself - the duty
+    # calculation service still starts and serves traffic.
+    db_logging.start()
+    yield
+    db_logging.stop()
+
+
+app = FastAPI(lifespan=lifespan)
 
 CW_NAMESPACE = "http://www.cargowise.com/Schemas/Universal/2011/11"
 NS = {"cw": CW_NAMESPACE}
@@ -109,6 +126,47 @@ def calculate_total_duty(root: ET.Element) -> tuple[str, float]:
     return shipment_number, total_duty
 
 
+def count_duty_lines(root: ET.Element) -> int:
+    """How many EntryLineCharge elements contributed to the duty total.
+
+    Logging only - does not affect the calculated amount.
+    """
+    count = 0
+    for entry_line in root.findall(".//cw:EntryLine", NS):
+        for charge in entry_line.findall(".//cw:EntryLineCharge", NS):
+            code_el = charge.find("cw:Type/cw:Code", NS)
+            amount_el = charge.find("cw:Amount", NS)
+            if code_el is not None and code_el.text == DUTY_CHARGE_CODE \
+                    and amount_el is not None and amount_el.text:
+                count += 1
+    return count
+
+
+def extract_context(root: ET.Element) -> dict:
+    """Best-effort pull of CargoWise DataContext identifiers for the log row.
+
+    Every field is optional; a missing element yields None rather than an error,
+    so a payload shape we have not seen before still gets logged.
+    """
+    def text_of(path: str):
+        el = root.find(path, NS)
+        return el.text.strip() if el is not None and el.text else None
+
+    return {
+        "company_code": text_of(".//cw:DataContext/cw:Company/cw:Code"),
+        "enterprise_id": text_of(".//cw:DataContext/cw:EnterpriseID"),
+        "server_id": text_of(".//cw:DataContext/cw:ServerID"),
+    }
+
+
+def client_ip_of(request: Request) -> str | None:
+    """Real caller IP. Render terminates TLS at its proxy, so prefer XFF."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
 def build_duty_update_xml(shipment_number: str, total_duty: float) -> str:
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
@@ -150,42 +208,159 @@ def push_to_cargowise(update_xml: str) -> requests.Response:
     return resp
 
 
+def _as_decimal(value: float) -> Decimal | None:
+    """Convert the calculated float to Decimal for the DECIMAL(19,4) column."""
+    try:
+        return Decimal(f"{value:.4f}")
+    except (InvalidOperation, ValueError):
+        return None
+
+
+# Guards /admin/dbcheck. Leave unset and the endpoint does not exist at all.
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+
+
 @app.get("/")
 def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "activity_log": db_logging.health()}
+
+
+@app.get("/admin/dbcheck")
+async def db_check(request: Request):
+    """On-demand Azure SQL diagnostic, for hosts with no shell access.
+
+        https://<your-service>.onrender.com/admin/dbcheck?token=<ADMIN_TOKEN>
+
+    Returns 404 rather than 401/403 when the token is absent or wrong, so the
+    endpoint is not discoverable by probing. Writes one Stage='Health' row on
+    success.
+
+    Set ADMIN_TOKEN in Render to enable it, and remove the variable once you
+    have finished verifying - query strings tend to end up in access logs.
+    """
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    supplied = request.headers.get("x-admin-token") or request.query_params.get("token") or ""
+    if not secrets.compare_digest(supplied, ADMIN_TOKEN):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    # diagnose() blocks on sockets and the driver; keep it off the event loop.
+    return await run_in_threadpool(db_logging.diagnose)
 
 
 @app.post("/cw/duty_calculation")
 async def receive_xml(request: Request):
+    correlation_id = uuid.uuid4()
+    started = time.monotonic()
+    client_ip = client_ip_of(request)
+
+    def elapsed_ms() -> int:
+        return int((time.monotonic() - started) * 1000)
+
     body = await request.body()
     xml_data = body.decode("utf-8")
 
-    os.makedirs("xml_logs", exist_ok=True)
-    xml_filename = f"xml_logs/cw_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.xml"
-    with open(xml_filename, "w", encoding="utf-8") as f:
-        f.write(xml_data)
+    # Metadata-only audit: fingerprint and size, never the document itself.
+    payload_sha = db_logging.sha256_of(body)
+    payload_bytes = len(body)
+
+    db_logging.log_event(LogEvent(
+        correlation_id=correlation_id,
+        stage="Inbound",
+        status="Received",
+        elapsed_ms=elapsed_ms(),
+        payload_bytes=payload_bytes,
+        payload_sha256=payload_sha,
+        client_ip=client_ip,
+    ))
 
     try:
         root = ET.fromstring(xml_data)
     except ET.ParseError as exc:
         logger.exception("Failed to parse inbound XML")
+        db_logging.log_event(LogEvent(
+            correlation_id=correlation_id,
+            stage="Inbound",
+            status="Rejected",
+            elapsed_ms=elapsed_ms(),
+            payload_bytes=payload_bytes,
+            payload_sha256=payload_sha,
+            client_ip=client_ip,
+            error_type="XMLParseError",
+            error_detail=str(exc),
+        ))
         raise HTTPException(status_code=400, detail=f"Invalid XML: {exc}") from exc
+
+    context = extract_context(root)
 
     try:
         shipment_number, total_duty = calculate_total_duty(root)
     except ValueError as exc:
         logger.exception("Failed to extract duty data")
+        db_logging.log_event(LogEvent(
+            correlation_id=correlation_id,
+            stage="Calc",
+            status="Rejected",
+            elapsed_ms=elapsed_ms(),
+            payload_bytes=payload_bytes,
+            payload_sha256=payload_sha,
+            client_ip=client_ip,
+            error_type="DutyExtractionError",
+            error_detail=str(exc),
+            **context,
+        ))
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     logger.info("Shipment %s total duty %.2f", shipment_number, total_duty)
 
+    db_logging.log_event(LogEvent(
+        correlation_id=correlation_id,
+        stage="Calc",
+        status="Processed",
+        elapsed_ms=elapsed_ms(),
+        shipment_number=shipment_number,
+        duty_amount=_as_decimal(total_duty),
+        duty_line_count=count_duty_lines(root),
+        client_ip=client_ip,
+        **context,
+    ))
+
     update_xml = build_duty_update_xml(shipment_number, total_duty)
 
     try:
-        push_to_cargowise(update_xml)
+        response = push_to_cargowise(update_xml)
     except requests.RequestException as exc:
         logger.exception("Failed to push duty update to CargoWise")
+        status_code = exc.response.status_code if exc.response is not None else None
+        db_logging.log_event(LogEvent(
+            correlation_id=correlation_id,
+            stage="Outbound",
+            status="Failed",
+            elapsed_ms=elapsed_ms(),
+            shipment_number=shipment_number,
+            duty_amount=_as_decimal(total_duty),
+            cw_http_status=status_code,
+            client_ip=client_ip,
+            error_type=type(exc).__name__,
+            error_detail=str(exc),
+            **context,
+        ))
         raise HTTPException(status_code=502, detail=f"CargoWise push failed: {exc}") from exc
 
     logger.info("Duty amount %.2f pushed to CargoWise for shipment %s", total_duty, shipment_number)
+
+    db_logging.log_event(LogEvent(
+        correlation_id=correlation_id,
+        stage="Outbound",
+        status="Pushed",
+        elapsed_ms=elapsed_ms(),
+        shipment_number=shipment_number,
+        duty_amount=_as_decimal(total_duty),
+        cw_http_status=response.status_code,
+        payload_bytes=len(update_xml.encode("utf-8")),
+        client_ip=client_ip,
+        **context,
+    ))
+
     return PlainTextResponse("OK")
