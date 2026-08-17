@@ -42,6 +42,7 @@ import hashlib
 import logging
 import os
 import queue
+import re
 import socket
 import threading
 import time
@@ -85,12 +86,30 @@ QUERY_TIMEOUT_SEC = 30
 # database) the writer stops trying. It re-tests once after this cooldown so
 # that fixing the setting in Azure heals the app on its own, without a redeploy,
 # while still not hammering the server with bad logins in the meantime.
-FATAL_RETRY_COOLDOWN_SEC = int(os.environ.get("SQL_LOG_FATAL_COOLDOWN", "600"))
+FATAL_RETRY_COOLDOWN_SEC = int(os.environ.get("SQL_LOG_FATAL_COOLDOWN", "60"))
 
 # Failures that retrying cannot fix. Retrying these wastes ~52s of backoff and
 # repeatedly throws bad logins at Azure, so the writer stops on the first one and
 # reports what actually needs changing.
+def _firewall_hint(exc: Exception) -> str:
+    """Name the exact address Azure rejected, so it can be pasted into a rule."""
+    match = re.search(r"IP address '([0-9A-Fa-f:.]+)'", str(exc))
+    address = f"'{match.group(1)}'" if match else "this service's outbound address"
+    return (
+        f"The Azure SQL firewall is blocking {address}. Add it - plus the other "
+        "outbound addresses listed under Render -> Connect -> Outbound, since the "
+        "one used can vary - at db-server-link-hv-08 -> Networking -> Firewall "
+        "rules. Azure notes the change can take up to 5 minutes to take effect."
+    )
+
+
 _FATAL_PATTERNS = (
+    (
+        # Error 40615. Azure's gateway answers the TCP connection and rejects at
+        # login, so a blocked address produces an explicit error, NOT a timeout.
+        "is not allowed to access the server",
+        _firewall_hint,
+    ),
     (
         "azure active directory only authentication is enabled",
         "The server has 'Microsoft Entra authentication only' ENABLED, so SQL "
@@ -120,7 +139,7 @@ def _fatal_reason(exc: Exception) -> Optional[str]:
     text = str(exc).lower()
     for pattern, hint in _FATAL_PATTERNS:
         if pattern in text:
-            return hint
+            return hint(exc) if callable(hint) else hint
     return None
 
 
@@ -530,12 +549,11 @@ def diagnose() -> dict:
         record("tcp", True, f"port 1433 open ({(time.monotonic() - started) * 1000:.0f} ms)")
     except socket.timeout:
         record("tcp", False, "timed out connecting to port 1433", [
-            "This is a FIREWALL problem, not a credentials problem.",
-            "Azure SQL drops packets from unlisted IPs instead of refusing them, "
-            "so a blocked address looks like a network fault.",
-            "Add this service's outbound IPs (Render -> Connect -> Outbound) under "
-            "db-server-link-hv-08 -> Networking -> Firewall rules.",
-            "'Allow Azure services' does NOT cover Render.",
+            "Note this is NOT the usual symptom of an IP firewall block - Azure "
+            "answers those at login with error 40615, which shows up at the login "
+            "step below, not here.",
+            "A timeout here points at egress being blocked before Azure, or public "
+            "network access being disabled on the server entirely.",
         ])
         return done()
     except socket.gaierror:
@@ -559,7 +577,11 @@ def diagnose() -> dict:
     except Exception as exc:  # noqa: BLE001
         text = str(exc).lower()
         elapsed = time.monotonic() - started
-        if "login failed" in text:
+        if "is not allowed to access the server" in text:
+            hints = [_firewall_hint(exc),
+                     "'Allow Azure services' does NOT cover Render - it is not an "
+                     "Azure service."]
+        elif "login failed" in text:
             hints = [
                 "If 'Microsoft Entra authentication only' is ENABLED on the server, "
                 "SQL logins are blocked entirely - uncheck it, or switch to a service "
