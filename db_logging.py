@@ -81,6 +81,49 @@ CONNECT_BACKOFF_SEC = [2, 5, 15, 30, 60]
 LOGIN_TIMEOUT_SEC = 60
 QUERY_TIMEOUT_SEC = 30
 
+# After a non-retryable failure (bad credentials, Entra-only auth, wrong
+# database) the writer stops trying. It re-tests once after this cooldown so
+# that fixing the setting in Azure heals the app on its own, without a redeploy,
+# while still not hammering the server with bad logins in the meantime.
+FATAL_RETRY_COOLDOWN_SEC = int(os.environ.get("SQL_LOG_FATAL_COOLDOWN", "600"))
+
+# Failures that retrying cannot fix. Retrying these wastes ~52s of backoff and
+# repeatedly throws bad logins at Azure, so the writer stops on the first one and
+# reports what actually needs changing.
+_FATAL_PATTERNS = (
+    (
+        "azure active directory only authentication is enabled",
+        "The server has 'Microsoft Entra authentication only' ENABLED, so SQL "
+        "logins are rejected regardless of the password. Either uncheck it "
+        "(Portal -> db-server-link-hv-08 -> Settings -> Microsoft Entra ID), or "
+        "switch the app to an Entra service principal with pyodbc.",
+    ),
+    (
+        "login failed for user",
+        "Credentials rejected. Check SQL_PASSWORD holds the password only - not "
+        "the surrounding N'...' from the CREATE USER statement - and that the "
+        "user exists in db-server-link-hv.",
+    ),
+    (
+        "cannot open database",
+        "SQL_DATABASE must be the database name (db-server-link-hv), not a table.",
+    ),
+    (
+        "password did not match",
+        "Credentials rejected. Verify SQL_PASSWORD.",
+    ),
+)
+
+
+def _fatal_reason(exc: Exception) -> Optional[str]:
+    """Return an actionable hint if this error will never resolve by retrying."""
+    text = str(exc).lower()
+    for pattern, hint in _FATAL_PATTERNS:
+        if pattern in text:
+            return hint
+    return None
+
+
 # Identifies which Render instance wrote the row; useful once you scale to >1.
 INSTANCE_ID = (
     os.environ.get("RENDER_INSTANCE_ID")
@@ -175,6 +218,10 @@ class _Writer(threading.Thread):
         self._conn = None
         self.dropped = 0
         self.written = 0
+        # Set once a non-retryable failure is seen; pauses connect attempts until
+        # FATAL_RETRY_COOLDOWN_SEC has passed, then allows one more try.
+        self.fatal_reason: Optional[str] = None
+        self.fatal_at: float = 0.0
 
     # -- connection handling -------------------------------------------------
 
@@ -201,6 +248,20 @@ class _Writer(threading.Thread):
                 return conn
             except Exception as exc:  # noqa: BLE001 - fail open
                 last_error = exc
+                # Configuration and credential problems never fix themselves.
+                # Stop immediately rather than retrying into a wall.
+                hint = _fatal_reason(exc)
+                if hint:
+                    self.fatal_reason = hint
+                    self.fatal_at = time.monotonic()
+                    logger.error(
+                        "Azure SQL activity logging PAUSED - this will not resolve "
+                        "by retrying.\n  Error: %s\n  Fix: %s\n  Will re-test in "
+                        "%d minutes; restart the service to retry immediately.",
+                        exc, hint, FATAL_RETRY_COOLDOWN_SEC // 60,
+                    )
+                    return None
+
                 delay = CONNECT_BACKOFF_SEC[min(attempt, len(CONNECT_BACKOFF_SEC) - 1)]
                 logger.warning(
                     "SQL log connect attempt %d/%d failed (%s). "
@@ -215,7 +276,16 @@ class _Writer(threading.Thread):
     def _ensure_conn(self) -> bool:
         if self._conn is not None:
             return True
+        if self.fatal_reason:
+            # Misconfigured. Stay quiet until the cooldown expires, then re-test
+            # once so that fixing it in Azure recovers without a redeploy.
+            if time.monotonic() - self.fatal_at < FATAL_RETRY_COOLDOWN_SEC:
+                return False
+            logger.info("Re-testing Azure SQL connection after cooldown")
+            self.fatal_reason = None
         self._conn = self._connect()
+        if self._conn is not None and self.fatal_reason is None:
+            logger.info("Azure SQL activity logging recovered")
         return self._conn is not None
 
     def _discard_conn(self) -> None:
@@ -374,13 +444,20 @@ def health() -> dict:
     """Small status blob for the health endpoint."""
     if _writer is None:
         return {"enabled": False, "reason": _disabled_reason or "not started"}
-    return {
+    status = {
         "enabled": True,
         "queued": _writer.queue.qsize(),
         "written": _writer.written,
         "dropped": _writer.dropped,
         "connected": _writer._conn is not None,
     }
+    if _writer.fatal_reason:
+        status["enabled"] = False
+        status["reason"] = _writer.fatal_reason
+        status["retry_in_seconds"] = max(
+            0, int(FATAL_RETRY_COOLDOWN_SEC - (time.monotonic() - _writer.fatal_at))
+        )
+    return status
 
 
 # --------------------------------------------------------------------------
