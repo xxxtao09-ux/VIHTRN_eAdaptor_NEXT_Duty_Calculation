@@ -1,4 +1,5 @@
 import base64
+import hmac
 import logging
 import os
 import secrets
@@ -13,9 +14,10 @@ import requests
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import PlainTextResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 import db_logging
 from db_logging import LogEvent
@@ -216,13 +218,88 @@ def _as_decimal(value: float) -> Decimal | None:
         return None
 
 
+# --------------------------------------------------------------------------
+# HTTP Basic authentication
+#
+# Credentials live only in Render environment variables - never in this repo.
+# If either variable is missing the service refuses every request (503) rather
+# than falling back to open access, so a misconfigured deploy fails closed.
+# --------------------------------------------------------------------------
+API_USERNAME = os.environ.get("API_USERNAME", "")
+API_PASSWORD = os.environ.get("API_PASSWORD", "")
+
+_basic_required = HTTPBasic(auto_error=True)
+_basic_optional = HTTPBasic(auto_error=False)
+
+_UNAUTHORIZED = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="Invalid credentials",
+    headers={"WWW-Authenticate": 'Basic realm="vih-duty-calc"'},
+)
+
+
+def _credentials_match(credentials: HTTPBasicCredentials) -> bool:
+    """Constant-time credential check.
+
+    Both comparisons are evaluated before they are combined, so the time taken
+    does not reveal whether it was the username or the password that was wrong.
+    """
+    user_ok = hmac.compare_digest(
+        credentials.username.encode("utf-8"), API_USERNAME.encode("utf-8")
+    )
+    pass_ok = hmac.compare_digest(
+        credentials.password.encode("utf-8"), API_PASSWORD.encode("utf-8")
+    )
+    return user_ok and pass_ok
+
+
+def _log_auth_failure(request: Request, attempted_username: str) -> None:
+    """Audit row for a rejected call. The attempted password is never logged."""
+    db_logging.log_event(LogEvent(
+        correlation_id=uuid.uuid4(),
+        stage="Auth",
+        status="Rejected",
+        client_ip=client_ip_of(request),
+        error_type="InvalidCredentials",
+        error_detail=f"username={attempted_username[:50]!r}",
+    ))
+
+
+def require_basic_auth(
+    request: Request,
+    credentials: HTTPBasicCredentials = Depends(_basic_required),
+) -> str:
+    if not API_USERNAME or not API_PASSWORD:
+        logger.error(
+            "API_USERNAME / API_PASSWORD are not set - refusing all requests"
+        )
+        raise HTTPException(status_code=503, detail="Service not configured")
+
+    if not _credentials_match(credentials):
+        logger.warning("Rejected request from %s", client_ip_of(request))
+        _log_auth_failure(request, credentials.username)
+        raise _UNAUTHORIZED
+
+    return credentials.username
+
+
 # Guards /admin/dbcheck. Leave unset and the endpoint does not exist at all.
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
 
 @app.get("/")
-def health_check():
-    return {"status": "ok", "activity_log": db_logging.health()}
+def health_check(credentials: HTTPBasicCredentials | None = Depends(_basic_optional)):
+    """Liveness probe.
+
+    Stays open so Render's health check keeps passing, but the activity-log
+    detail is only returned to an authenticated caller - ``db_logging.health()``
+    can surface Azure SQL error text.
+    """
+    body = {"status": "ok"}
+    if credentials is not None and API_USERNAME and API_PASSWORD \
+            and _credentials_match(credentials):
+        body["activity_log"] = db_logging.health()
+    return body
 
 
 @app.get("/admin/dbcheck")
@@ -250,7 +327,10 @@ async def db_check(request: Request):
 
 
 @app.post("/cw/duty_calculation")
-async def receive_xml(request: Request):
+async def receive_xml(
+    request: Request,
+    _caller: str = Depends(require_basic_auth),
+):
     correlation_id = uuid.uuid4()
     started = time.monotonic()
     client_ip = client_ip_of(request)
